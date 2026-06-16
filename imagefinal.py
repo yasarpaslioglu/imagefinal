@@ -77,140 +77,179 @@ def baseline_pipeline(image_path):
 
 def proposed_pipeline(image_path, kernel_size=(15, 15)):
     """
-    IMPROVED HYBRID ALGORITHM: Multiscale Sobel & Black Hat -> Aligned Character-based scoring -> Localized OCR
+    IMPROVED HYBRID ALGORITHM v2:
+    - Dual-channel binary maps (Sobel-X + Black Hat)
+    - Multiscale morphological closing at 5 kernel widths
+    - Improved scoring: spacing uniformity + n_chars cap (prevents noisy
+      background regions from outscoring true plates)
+    - Three-stage fallback: strict → relaxed → geometric
     """
     img = cv2.imread(image_path)
     if img is None:
         return "", [], None
-    
+
     h, w, _ = img.shape
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # 1. Edge detection using Sobel X
+
+    # ── Stage 1: Dual binary maps ──────────────────────────────────────────
     sobel = cv2.Sobel(gray, cv2.CV_8U, 1, 0, ksize=3)
     _, thresh_sobel = cv2.threshold(sobel, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    
-    # 2. Black Hat
+
     kernel_bh = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
     blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel_bh)
     _, thresh_bh = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    
+
+    # ── Stage 2: Multiscale candidate extraction ───────────────────────────
     candidates = []
-    # Multiscale closing kernels
     scales = [9, 17, 29, 47, 65]
     for s_w in scales:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (s_w, 3))
-        
-        # Sobel close
-        closed_sobel = cv2.morphologyEx(thresh_sobel, cv2.MORPH_CLOSE, kernel)
-        contours_sobel, _ = cv2.findContours(closed_sobel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Blackhat close
-        closed_bh = cv2.morphologyEx(thresh_bh, cv2.MORPH_CLOSE, kernel)
-        contours_bh, _ = cv2.findContours(closed_bh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for cnt in contours_sobel + contours_bh:
-            x, y, w_box, h_box = cv2.boundingRect(cnt)
-            aspect_ratio = w_box / float(h_box) if h_box > 0 else 0
-            area = w_box * h_box
-            if 1.5 < aspect_ratio < 7.0 and 400 < area < 70000:
-                candidates.append([x, y, w_box, h_box])
-                
-    # Deduplicate candidates
+        for thresh_map in [thresh_sobel, thresh_bh]:
+            closed = cv2.morphologyEx(thresh_map, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                x, y, wb, hb = cv2.boundingRect(cnt)
+                ar = wb / float(hb) if hb > 0 else 0
+                if 1.5 < ar < 7.0 and 400 < wb * hb < 70000:
+                    candidates.append([x, y, wb, hb])
+
+    # Deduplicate (IoU > 0.8)
     unique_candidates = []
     for c in candidates:
         is_dup = False
         for uc in unique_candidates:
-            # Simple IoU overlap check
-            xA = max(c[0], uc[0])
-            yA = max(c[1], uc[1])
-            xB = min(c[0] + c[2], uc[0] + uc[2])
-            yB = min(c[1] + c[3], uc[1] + uc[3])
-            interArea = max(0, xB - xA) * max(0, yB - yA)
-            boxAArea = c[2] * c[3]
-            boxBArea = uc[2] * uc[3]
-            iou = interArea / float(boxAArea + boxBArea - interArea) if (boxAArea + boxBArea - interArea) > 0 else 0
-            if iou > 0.8:
-                is_dup = True
-                break
+            xA = max(c[0], uc[0]); yA = max(c[1], uc[1])
+            xB = min(c[0]+c[2], uc[0]+uc[2]); yB = min(c[1]+c[3], uc[1]+uc[3])
+            inter = max(0, xB-xA) * max(0, yB-yA)
+            union = c[2]*c[3] + uc[2]*uc[3] - inter
+            if union > 0 and inter/union > 0.8:
+                is_dup = True; break
         if not is_dup:
             unique_candidates.append(c)
-            
-    best_candidate = None
-    best_score = -1
-    best_roi_padded = None
-    best_char_boxes = []
-    
-    for c in unique_candidates:
+
+    # ── Scoring helper ─────────────────────────────────────────────────────
+    def score_candidate(c, min_chars=3):
         cx, cy, cw, ch = c
-        aligned_chars = []
-        pad_x = int(cw * 0.05)
-        pad_y = int(ch * 0.1)
-        x1 = max(0, cx - pad_x)
-        y1 = max(0, cy - pad_y)
-        x2 = min(w, cx + cw + pad_x)
-        y2 = min(h, cy + ch + pad_y)
-        
+        pad_x = int(cw * 0.05); pad_y = int(ch * 0.10)
+        x1 = max(0, cx-pad_x); y1 = max(0, cy-pad_y)
+        x2 = min(w, cx+cw+pad_x); y2 = min(h, cy+ch+pad_y)
+
         roi_gray = gray[y1:y2, x1:x2]
         if roi_gray.size == 0:
-            continue
-            
-        # Local Black Hat thresholding for character extraction inside crop
-        roi_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-        roi_blackhat = cv2.morphologyEx(roi_gray, cv2.MORPH_BLACKHAT, roi_kernel)
-        _, roi_thresh = cv2.threshold(roi_blackhat, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        
-        roi_contours, _ = cv2.findContours(roi_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        char_cnts = []
+            return -1000, [], None
+
+        # Local Black Hat + Otsu for character isolation
+        rk = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        roi_bh = cv2.morphologyEx(roi_gray, cv2.MORPH_BLACKHAT, rk)
+        _, roi_thresh = cv2.threshold(roi_bh, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        roi_cnts, _ = cv2.findContours(roi_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         roi_h = y2 - y1
-        for r_cnt in roi_contours:
+
+        char_cnts = []
+        for r_cnt in roi_cnts:
             rx, ry, rw, rh = cv2.boundingRect(r_cnt)
             r_aspect = rh / float(rw) if rw > 0 else 0
-            if 0.8 < r_aspect < 5.0 and 0.3 * roi_h < rh < 0.95 * roi_h:
+            if 0.8 < r_aspect < 5.0 and 0.3*roi_h < rh < 0.95*roi_h:
                 char_cnts.append([rx, ry, rw, rh])
-                
-        if len(char_cnts) >= 3:
+
+        aligned_chars = []
+        if len(char_cnts) >= min_chars:
             char_cnts = sorted(char_cnts, key=lambda b: b[0])
-            median_cy = np.median([b[1] + b[3]/2 for b in char_cnts])
+            median_cy = np.median([b[1]+b[3]/2 for b in char_cnts])
             median_ch = np.median([b[3] for b in char_cnts])
-            
             for b in char_cnts:
-                cy_center = b[1] + b[3]/2
-                if abs(cy_center - median_cy) < median_ch * 0.4:
-                    # Convert coordinates back to global image coordinates
-                    aligned_chars.append([b[0] + x1, b[1] + y1, b[2], b[3]])
-                    
-            n_chars = len(aligned_chars)
-            
-            if n_chars >= 3:
-                heights = [b[3] for b in aligned_chars]
-                std_h = np.std(heights)
-                mean_h = np.mean(heights)
-                h_uniformity = 1.0 - (std_h / mean_h) if mean_h > 0 else 0
-                
-                crop_aspect = cw / float(ch) if ch > 0 else 0
-                aspect_penalty = abs(crop_aspect - 4.5)
-                
-                score = n_chars * 15.0 + h_uniformity * 30.0 - aspect_penalty * 5.0
-            else:
-                score = -100
+                if abs(b[1]+b[3]/2 - median_cy) < median_ch * 0.4:
+                    aligned_chars.append([b[0]+x1, b[1]+y1, b[2], b[3]])
+
+        n_chars = len(aligned_chars)
+        if n_chars < min_chars:
+            return -1000, [], None
+
+        # Height uniformity
+        heights = [b[3] for b in aligned_chars]
+        h_uniformity = 1.0 - (np.std(heights)/np.mean(heights)) if np.mean(heights) > 0 else 0
+
+        # Spacing uniformity (NEW: evenly spaced chars = true plate)
+        x_centers = sorted([b[0]+b[2]/2 for b in aligned_chars])
+        if len(x_centers) >= 2:
+            gaps = [x_centers[i+1]-x_centers[i] for i in range(len(x_centers)-1)]
+            gap_mean = np.mean(gaps)
+            spacing_uniformity = 1.0 - (np.std(gaps)/gap_mean) if gap_mean > 0 else 0
         else:
-            score = -100
-            
+            spacing_uniformity = 0.0
+
+        # Aspect ratio penalty (ideal ≈ 4.0–4.5 for Turkish plates)
+        crop_aspect = cw / float(ch) if ch > 0 else 0
+        aspect_penalty = abs(crop_aspect - 4.0)
+
+        # n_chars: cap benefit at 10; penalize excess chars
+        # (Background clutter often produces 15–30 char-like blobs)
+        n_effective = min(n_chars, 10)
+        n_overload = max(0, n_chars - 10) * 6.0
+
+        score = (n_effective * 12.0
+                 + h_uniformity * 25.0
+                 + spacing_uniformity * 20.0
+                 - aspect_penalty * 5.0
+                 - n_overload)
+
+        roi_padded = cv2.copyMakeBorder(roi_thresh, 15, 15, 15, 15,
+                                        cv2.BORDER_CONSTANT, value=[255, 255, 255])
+        return score, aligned_chars, roi_padded
+
+    # ── Pass 1: Strict (min 3 aligned chars, score > 0) ───────────────────
+    best_candidate = None
+    best_score = -1
+    best_char_boxes = []
+    best_roi_padded = None
+
+    for c in unique_candidates:
+        score, aligned_chars, roi_padded = score_candidate(c, min_chars=3)
         if score > 0 and score > best_score:
             best_score = score
             best_candidate = c
             best_char_boxes = aligned_chars
-            # Pad with white (255) pixels for OCR
-            best_roi_padded = cv2.copyMakeBorder(roi_thresh, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=[255, 255, 255])
-            
+            best_roi_padded = roi_padded
+
+    # ── Pass 2: Relaxed fallback (min 2 aligned chars, score > -30) ───────
+    # Catches plates where one character was missed by the contour filter
+    if best_candidate is None:
+        for c in unique_candidates:
+            score, aligned_chars, roi_padded = score_candidate(c, min_chars=2)
+            if score > -30 and score > best_score:
+                best_score = score
+                best_candidate = c
+                best_char_boxes = aligned_chars
+                best_roi_padded = roi_padded
+
+    # ── Pass 3: Geometric fallback ─────────────────────────────────────────
+    # If both passes fail, use the candidate whose aspect ratio is closest
+    # to 4.0 (typical Turkish plate). This ensures we always attempt OCR.
+    if best_candidate is None and unique_candidates:
+        def geo_score(c):
+            return -abs((c[2] / float(c[3]) if c[3] > 0 else 0) - 4.0)
+        best_geo = max(unique_candidates, key=geo_score)
+        cx, cy, cw, ch = best_geo
+        x1 = max(0, cx); y1 = max(0, cy)
+        x2 = min(w, cx+cw); y2 = min(h, cy+ch)
+        roi_gray = gray[y1:y2, x1:x2]
+        if roi_gray.size > 0:
+            rk = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+            roi_bh = cv2.morphologyEx(roi_gray, cv2.MORPH_BLACKHAT, rk)
+            _, roi_thresh = cv2.threshold(roi_bh, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            best_candidate = best_geo
+            best_char_boxes = []
+            best_roi_padded = cv2.copyMakeBorder(roi_thresh, 15, 15, 15, 15,
+                                                  cv2.BORDER_CONSTANT, value=[255, 255, 255])
+
+    # ── OCR on best region ─────────────────────────────────────────────────
     plate_text = ""
     if best_roi_padded is not None:
         config = '--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
         plate_text = pytesseract.image_to_string(best_roi_padded, config=config).strip()
         plate_text = ''.join(e for e in plate_text if e.isalnum())
-        
+
     return plate_text, best_char_boxes, best_candidate
 
 # ==========================================
