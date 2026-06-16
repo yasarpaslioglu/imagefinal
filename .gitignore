@@ -1,0 +1,36 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary / debug outputs (not part of the submission)
+debug_output/
+cropped_plates/
+candidates.json
+debug_roi_thresh.png
+grid.png
+mapping.txt
+
+# Report generation scripts (internal tools)
+generate_figures.py
+generate_report.py
+inspect_failures.py
+read_rubric.py
+rubric_text.txt
+test_improved_scoring.py
+copy_and_preprocess.py
+create_grid.py
